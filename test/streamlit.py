@@ -9,7 +9,7 @@ from io import BytesIO
 from voicefixer import VoiceFixer
 
 
-@st.experimental_singleton
+@st.cache_resource
 def init_voicefixer():
     return VoiceFixer()
 
