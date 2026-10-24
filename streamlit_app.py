@@ -10,8 +10,14 @@ Arrancar:              streamlit run streamlit_app.py
 
 import ctypes
 import gc
+import hashlib
+import http.client
+import os
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -33,12 +39,146 @@ MODE_LABELS = {
     2: "Modo 2 · train",
 }
 
+# Mismas rutas que usa la librería. MD5 oficiales de https://zenodo.org/records/5600188
+_CACHE = Path(os.path.expanduser("~")) / ".cache" / "voicefixer"
+WEIGHTS = [
+    {
+        "label": "vf.ckpt (análisis, ~490 MB)",
+        "path": _CACHE / "analysis_module" / "checkpoints" / "vf.ckpt",
+        "md5": "1f479dabb9fa5724de5e20f2164cbc7a",
+        "urls": [
+            "https://zenodo.org/records/5600188/files/vf.ckpt?download=1",
+            "https://huggingface.co/teamup-tech/VoiceFixer-weights/resolve/main/vf.ckpt",
+        ],
+    },
+    {
+        "label": "model.ckpt-1490000_trimed.pt (vocoder, ~136 MB)",
+        "path": _CACHE / "synthesis_module" / "44100" / "model.ckpt-1490000_trimed.pt",
+        "md5": "ac6de16561dd6042daf8bb3a806dc818",
+        "urls": [
+            "https://zenodo.org/records/5600188/files/model.ckpt-1490000_trimed.pt?download=1",
+            "https://huggingface.co/teamup-tech/VoiceFixer-weights/resolve/main/model.ckpt-1490000_trimed.pt",
+        ],
+    },
+]
+
 st.set_page_config(page_title="VoiceFixer", page_icon="🎙️", layout="wide")
+
+
+# --------------------------------------------------------------------------- pesos
+
+def md5_file(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while block := f.read(8 << 20):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download(url, part, bar, label):
+    """Descarga a `part`, reanudando si ya hay un trozo. Devuelve True si reanudó."""
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"User-Agent": "voicefixer-streamlit/1.0"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    try:
+        resp = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:  # el .part ya estaba completo
+            return True
+        raise
+
+    with resp:
+        resumed = bool(have) and resp.status == 206
+        if not resumed:
+            have = 0
+        total = have + int(resp.headers.get("Content-Length") or 0)
+        done, last = have, 0.0
+        with open(part, "ab" if resumed else "wb") as f:
+            while block := resp.read(1 << 20):
+                f.write(block)
+                done += len(block)
+                if time.time() - last > 0.25:
+                    last = time.time()
+                    frac = min(done / total, 1.0) if total else 0.0
+                    bar.progress(frac, text=f"Descargando {label}: {done / 1e6:.0f} / {total / 1e6:.0f} MB")
+    if total and done < total:
+        # Si el servidor corta la conexión, read() termina sin error: hay que comprobarlo.
+        raise ConnectionError(f"descarga cortada en {done / 1e6:.0f} de {total / 1e6:.0f} MB")
+    return resumed
+
+
+def fetch(w, bar):
+    """Descarga un checkpoint probando cada URL y lo valida por MD5 antes de usarlo."""
+    dest = w["path"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    errors = []
+    for url in w["urls"]:
+        host = urllib.parse.urlparse(url).netloc
+        for attempt in range(3):
+            try:
+                resumed = download(url, part, bar, w["label"])
+            except urllib.error.HTTPError as e:
+                errors.append(f"{host}: HTTP {e.code}")
+                if e.code in (408, 429) or e.code >= 500:
+                    time.sleep(3 * (attempt + 1))
+                    continue  # error temporal del servidor: reintentar
+                break  # 404, 403…: probar el siguiente servidor
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+                errors.append(f"{host}: {e}")
+                time.sleep(3 * (attempt + 1))
+                continue  # reintenta; el .part se reanuda
+            bar.progress(1.0, text=f"Verificando {w['label']}…")
+            if md5_file(part) == w["md5"]:
+                os.replace(part, dest)
+                return
+            part.unlink()
+            errors.append(f"{host}: el archivo descargado no coincide con el MD5 oficial")
+            if not resumed:
+                break  # contenido distinto en este servidor: probar el siguiente
+    raise RuntimeError("\n".join(errors[-4:]))
+
+
+@st.cache_resource
+def _weights_state():
+    return {"ok": False, "lock": threading.Lock()}
+
+
+def ensure_weights():
+    """Comprueba (una vez por arranque) que los pesos están completos; si no, los repara."""
+    state = _weights_state()
+    if state["ok"]:
+        return
+    with state["lock"]:  # dos pestañas no deben descargar el mismo archivo a la vez
+        if state["ok"]:
+            return
+        status = st.status("Comprobando los pesos del modelo…", expanded=True)
+        bar = status.progress(0.0)
+        for w in WEIGHTS:
+            if w["path"].exists():
+                bar.progress(0.0, text=f"Verificando {w['label']}…")
+                if md5_file(w["path"]) == w["md5"]:
+                    continue
+                status.warning(f"{w['label']} estaba incompleto o dañado. Se descarga de nuevo.")
+                w["path"].unlink()
+            try:
+                fetch(w, bar)
+            except RuntimeError as e:
+                status.update(label="No se pudieron descargar los pesos", state="error")
+                st.error(
+                    f"No se pudo descargar **{w['label']}**.\n\n```\n{e}\n```\n\n"
+                    f"Descárgalo a mano desde [Zenodo](https://zenodo.org/records/5600188) "
+                    f"y guárdalo en:\n\n`{w['path']}`\n\nLuego recarga la página."
+                )
+                st.stop()
+        status.update(label="Pesos del modelo verificados", state="complete", expanded=False)
+        state["ok"] = True
 
 
 # --------------------------------------------------------------------------- modelo
 
-@st.cache_resource(show_spinner="Cargando modelos… la primera vez se descargan (~600 MB).")
+@st.cache_resource(show_spinner="Cargando el modelo en memoria…")
 def load_model():
     # torch >= 2.6 usa weights_only=True por defecto y los checkpoints de VoiceFixer
     # (2021) pueden no cargar así. Los pesos vienen del Zenodo oficial del autor.
@@ -50,7 +190,7 @@ def load_model():
 
     torch.load = _load
 
-    # La importación descarga los pesos a ~/.cache/voicefixer si no existen.
+    # ensure_weights() ya dejó los pesos verificados, así que la librería no descarga nada.
     from voicefixer import VoiceFixer
 
     model = VoiceFixer()
@@ -176,6 +316,7 @@ st.caption(
     "Basado en [haoheliu/voicefixer](https://github.com/haoheliu/voicefixer)."
 )
 
+ensure_weights()
 voice_fixer = load_model()
 
 files = st.file_uploader(
