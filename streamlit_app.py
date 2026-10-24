@@ -1,14 +1,20 @@
-"""VoiceFixer en Streamlit Community Cloud.
+"""VoiceFixer: interfaz web con Streamlit.
 
 Coloca este archivo en la RAÍZ del repositorio (junto a setup.py y la carpeta
 voicefixer/). Así Python importa el paquete local `voicefixer` sin instalarlo.
+
+Local con GPU NVIDIA:  pip install -r requirements-cuda.txt
+Local o nube sin GPU:  pip install -r requirements.txt
+Arrancar:              streamlit run streamlit_app.py
 """
 
 import ctypes
 import gc
 import threading
 import time
+import zipfile
 from io import BytesIO
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -17,19 +23,22 @@ import streamlit as st
 import torch
 
 SAMPLE_RATE = 44100
-MAX_SECONDS = 60      # en la CPU gratuita cada minuto de audio tarda varios minutos
-CHUNK_SECONDS = 5     # trozos pequeños: mantienen la RAM por debajo del límite (~2,7 GB)
-OVERLAP_SECONDS = 0.25
+CHUNK_SECONDS_GPU = 30  # trozo nativo del modelo; una GPU con mucha VRAM lo procesa de una vez
+CHUNK_SECONDS_CPU = 5   # trozos pequeños para no agotar la RAM (p. ej. ~2,7 GB en Streamlit Cloud)
+OVERLAP_SECONDS = 0.25  # fundido cruzado entre trozos para que no se noten los cortes
 
-st.set_page_config(page_title="VoiceFixer", page_icon="🎙️")
-st.title("🎙️ VoiceFixer")
-st.caption(
-    "Restaura voz degradada (ruido, reverberación, baja resolución, clipping). "
-    "Basado en [haoheliu/voicefixer](https://github.com/haoheliu/voicefixer)."
-)
+MODE_LABELS = {
+    0: "Modo 0 · original",
+    1: "Modo 1 · preprocesado",
+    2: "Modo 2 · train",
+}
+
+st.set_page_config(page_title="VoiceFixer", page_icon="🎙️", layout="wide")
 
 
-@st.cache_resource(show_spinner="Cargando modelos… la primera vez se descargan (puede tardar unos minutos).")
+# --------------------------------------------------------------------------- modelo
+
+@st.cache_resource(show_spinner="Cargando modelos… la primera vez se descargan (~600 MB).")
 def load_model():
     # torch >= 2.6 usa weights_only=True por defecto y los checkpoints de VoiceFixer
     # (2021) pueden no cargar así. Los pesos vienen del Zenodo oficial del autor.
@@ -41,18 +50,18 @@ def load_model():
 
     torch.load = _load
 
-    # La importación descarga los pesos desde Zenodo a ~/.cache/voicefixer si no existen.
+    # La importación descarga los pesos a ~/.cache/voicefixer si no existen.
     from voicefixer import VoiceFixer
 
     model = VoiceFixer()
 
     # El modo 2 pone el modelo en train(); con momentum=0 la BatchNorm usa las
-    # estadísticas del lote pero no altera las guardadas, que comparten todos los usuarios.
+    # estadísticas del lote pero no altera las guardadas, que usan los modos 0 y 1.
     for m in model._model.modules():
         if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
             m.momentum = 0.0
 
-    # Devuelve al sistema la RAM temporal usada al leer los checkpoints.
+    # Devuelve al sistema la RAM temporal usada al leer los checkpoints (Linux).
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
@@ -63,13 +72,27 @@ def load_model():
 
 @st.cache_resource
 def model_lock():
-    # Un solo modelo compartido entre usuarios: evitamos inferencias simultáneas.
+    # Un solo modelo compartido entre pestañas/usuarios: inferencias de una en una.
     return threading.Lock()
 
 
-def restore(model, audio, mode, progress):
-    """Procesa en trozos con un pequeño fundido cruzado entre ellos."""
-    chunk = CHUNK_SECONDS * SAMPLE_RATE
+def gpu_supported(major, minor):
+    """¿Trae este build de PyTorch kernels para la arquitectura de la GPU?"""
+    for arch in torch.cuda.get_arch_list():
+        kind, _, num = arch.partition("_")
+        if not num.isdigit():
+            continue
+        a_major, a_minor = int(num[:-1]), int(num[-1])
+        if kind == "sm" and a_major == major and a_minor <= minor:
+            return True
+        if kind == "compute" and (a_major, a_minor) <= (major, minor):
+            return True
+    return False
+
+
+def restore(model, audio, mode, cuda, chunk_seconds, on_chunk):
+    """Restaura `audio` por trozos con fundido cruzado. Sin límite de duración."""
+    chunk = int(chunk_seconds * SAMPLE_RATE)
     overlap = int(OVERLAP_SECONDS * SAMPLE_RATE)
     hop = chunk - overlap
     starts = list(range(0, max(len(audio) - overlap, 1), hop))
@@ -78,68 +101,204 @@ def restore(model, audio, mode, progress):
 
     for i, start in enumerate(starts):
         seg = audio[start : start + chunk]
-        y = model.restore_inmem(seg, mode=mode, cuda=False).reshape(-1).astype(np.float32)
+        # restore_inmem mueve el modelo a GPU o CPU según `cuda`
+        y = model.restore_inmem(seg, mode=mode, cuda=cuda).reshape(-1).astype(np.float32)
         y = librosa.util.fix_length(y, size=len(seg))
         if start > 0:
             n = min(overlap, len(seg))
             y[:n] *= fade_in[:n]
             out[start : start + n] *= 1.0 - fade_in[:n]
         out[start : start + len(seg)] += y
-        progress.progress((i + 1) / len(starts), text=f"Procesando… {i + 1}/{len(starts)}")
+        on_chunk(i + 1, len(starts))
 
     peak = np.abs(out).max()
     return out / peak if peak > 1.0 else out
 
 
-voice_fixer = load_model()
+def output_name(file_name, mode):
+    return f"{Path(file_name).stem}_voicefixer_modo{mode}.wav"
 
-uploaded = st.file_uploader("Sube un audio con voz", type=["wav", "flac", "mp3", "ogg"])
 
-mode = st.radio(
-    "Modo",
-    options=[0, 1, 2],
-    format_func=lambda m: {
-        0: "0 · Modelo original (recomendado)",
-        1: "1 · Con preprocesado (quita altas frecuencias)",
-        2: "2 · Modo train (a veces mejor en voz muy dañada)",
-    }[m],
+def build_zip(results, names):
+    buf = BytesIO()
+    used = set()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        for r in results:
+            name = output_name(names[r["file_idx"]], r["mode"])
+            if name in used:  # dos archivos subidos con el mismo nombre
+                name = f"{r['file_idx'] + 1:02d}_{name}"
+            used.add(name)
+            zf.writestr(name, r["wav"])
+    return buf.getvalue()
+
+
+def fmt_secs(s):
+    m, s = divmod(int(round(s)), 60)
+    return f"{m} min {s:02d} s" if m else f"{s} s"
+
+
+# --------------------------------------------------------------------------- barra lateral
+
+with st.sidebar:
+    st.header("Dispositivo")
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        major, minor = torch.cuda.get_device_capability(0)
+        st.success(f"**{props.name}**  \n{props.total_memory / 1024**3:.0f} GB VRAM · sm_{major}{minor}")
+        st.caption(f"PyTorch {torch.__version__} · CUDA {torch.version.cuda}")
+        if gpu_supported(major, minor):
+            use_gpu = st.toggle("Usar GPU", value=True)
+        else:
+            st.error(
+                f"Esta versión de PyTorch no trae soporte para sm_{major}{minor}. "
+                "Reinstala con `pip install -r requirements-cuda.txt` (CUDA 13.0). "
+                "Mientras tanto se usará la CPU."
+            )
+            use_gpu = False
+    else:
+        st.info("No hay GPU CUDA disponible: se usará la CPU (bastante más lento).")
+        if torch.version.cuda is None:
+            st.caption(
+                f"PyTorch {torch.__version__} es la versión solo CPU. Si tienes una GPU "
+                "NVIDIA, instala `requirements-cuda.txt`."
+            )
+        use_gpu = False
+
+    chunk_seconds = CHUNK_SECONDS_GPU if use_gpu else CHUNK_SECONDS_CPU
+    st.caption(f"Se procesa en trozos de {chunk_seconds} s, sin límite de duración.")
+
+
+# --------------------------------------------------------------------------- página
+
+st.title("🎙️ VoiceFixer")
+st.caption(
+    "Restaura voz degradada (ruido, reverberación, baja resolución, clipping). "
+    "Basado en [haoheliu/voicefixer](https://github.com/haoheliu/voicefixer)."
 )
 
-if uploaded is not None:
-    st.subheader("Original")
-    st.audio(uploaded)
+voice_fixer = load_model()
 
-    if st.button("Restaurar audio", type="primary"):
-        uploaded.seek(0)
-        audio, _ = librosa.load(uploaded, sr=SAMPLE_RATE, mono=True)
-        seconds = len(audio) / SAMPLE_RATE
+files = st.file_uploader(
+    "Sube uno o varios audios con voz",
+    type=["wav", "flac", "mp3", "ogg"],
+    accept_multiple_files=True,
+)
 
-        if seconds > MAX_SECONDS:
-            st.warning(
-                f"El audio dura {seconds:.0f} s. Se procesarán solo los primeros "
-                f"{MAX_SECONDS} s para que no tarde demasiado en el servidor gratuito."
-            )
-            audio = audio[: MAX_SECONDS * SAMPLE_RATE]
+mode_choice = st.radio(
+    "Modo",
+    options=[0, 1, 2, "todos"],
+    format_func=lambda m: {
+        0: "0 · Original (recomendado)",
+        1: "1 · Preprocesado (quita altas frecuencias)",
+        2: "2 · Train (a veces mejor en voz muy dañada)",
+        "todos": "Todos · comparar 0, 1 y 2",
+    }[m],
+    horizontal=True,
+)
+modes = [0, 1, 2] if mode_choice == "todos" else [mode_choice]
 
-        progress = st.progress(0.0, text="En cola…")
-        t0 = time.time()
-        with model_lock(), torch.no_grad():  # no_grad es por hilo: va aquí, no al cargar
-            restored = restore(voice_fixer, audio, mode, progress)
-        elapsed = time.time() - t0
-        progress.empty()
+names = [f.name for f in files]
+signature = tuple((f.name, f.size) for f in files)
+has_results = bool(files) and st.session_state.get("signature") == signature
 
-        buf = BytesIO()
-        sf.write(buf, restored, samplerate=SAMPLE_RATE, format="WAV")
-        st.session_state["result"] = (buf.getvalue(), elapsed, uploaded.name)
+if files and not has_results:
+    with st.expander(f"Escuchar originales ({len(files)})", expanded=len(files) == 1):
+        for f in files:
+            st.caption(f.name)
+            st.audio(f)
 
-    if "result" in st.session_state and st.session_state["result"][2] == uploaded.name:
-        wav_bytes, elapsed, name = st.session_state["result"]
-        st.subheader("Restaurado")
-        st.audio(wav_bytes, format="audio/wav")
-        st.caption(f"Tiempo de proceso: {elapsed:.1f} s")
-        st.download_button(
-            "Descargar WAV",
-            data=wav_bytes,
-            file_name=name.rsplit(".", 1)[0] + "_voicefixer.wav",
-            mime="audio/wav",
+if files:
+    label = "Restaurar audio" if len(files) == 1 else f"Restaurar {len(files)} audios"
+    if len(modes) > 1:
+        label += " en los 3 modos"
+    if st.button(label, type="primary"):
+        results = []
+        total_units = len(files) * len(modes)
+        bar = st.progress(0.0, text="En cola…")
+        t_all = time.time()
+
+        with model_lock(), torch.no_grad():  # no_grad es por hilo: va aquí
+            for fi, f in enumerate(files):
+                bar.progress(fi * len(modes) / total_units, text=f"Leyendo {f.name}…")
+                f.seek(0)
+                audio, _ = librosa.load(f, sr=SAMPLE_RATE, mono=True)
+
+                for mi, m in enumerate(modes):
+                    unit = fi * len(modes) + mi
+
+                    def on_chunk(i, n, unit=unit, name=f.name, m=m):
+                        bar.progress(
+                            min((unit + i / n) / total_units, 1.0),
+                            text=f"{name} · {MODE_LABELS[m]} · trozo {i}/{n}",
+                        )
+
+                    t0 = time.time()
+                    y = restore(voice_fixer, audio, m, use_gpu, chunk_seconds, on_chunk)
+                    wav = BytesIO()
+                    sf.write(wav, y, samplerate=SAMPLE_RATE, format="WAV")
+                    results.append({
+                        "file_idx": fi,
+                        "mode": m,
+                        "wav": wav.getvalue(),
+                        "elapsed": time.time() - t0,
+                        "duration": len(audio) / SAMPLE_RATE,
+                    })
+                del audio
+
+        if use_gpu:
+            torch.cuda.empty_cache()
+        bar.empty()
+
+        st.session_state.update(
+            signature=signature,
+            results=results,
+            zip=build_zip(results, names) if len(results) > 1 else None,
+            total_time=time.time() - t_all,
         )
+        has_results = True
+
+# --------------------------------------------------------------------------- resultados
+
+if has_results:
+    results = st.session_state["results"]
+    st.subheader("Resultados")
+
+    head = st.columns([3, 1])
+    head[0].caption(
+        f"{len(files)} archivo(s) · {len(results)} salida(s) · "
+        f"procesado en {fmt_secs(st.session_state['total_time'])}"
+    )
+    if st.session_state["zip"]:
+        head[1].download_button(
+            "Descargar todo (ZIP)",
+            data=st.session_state["zip"],
+            file_name="voicefixer_resultados.zip",
+            mime="application/zip",
+            type="primary",
+            width="stretch",
+        )
+
+    for fi, f in enumerate(files):
+        file_results = [r for r in results if r["file_idx"] == fi]
+        if not file_results:
+            continue
+        with st.expander(
+            f"{f.name} · {fmt_secs(file_results[0]['duration'])}",
+            expanded=len(files) <= 3,
+        ):
+            cols = st.columns(1 + len(file_results))
+            with cols[0]:
+                st.markdown("**Original**")
+                st.audio(f)
+            for col, r in zip(cols[1:], file_results):
+                with col:
+                    st.markdown(f"**{MODE_LABELS[r['mode']]}**")
+                    st.audio(r["wav"], format="audio/wav")
+                    st.caption(f"Tiempo: {r['elapsed']:.1f} s")
+                    st.download_button(
+                        "Descargar WAV",
+                        data=r["wav"],
+                        file_name=output_name(f.name, r["mode"]),
+                        mime="audio/wav",
+                        key=f"dl_{fi}_{r['mode']}",
+                    )
