@@ -1,0 +1,3 @@
+[server]
+# Tamaño máximo por archivo subido, en MB. Streamlit trae 200 MB por defecto.
+maxUploadSize = 10240
